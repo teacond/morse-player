@@ -1,5 +1,5 @@
 [package]
-name = "morse_audio_module"
+name = "morse_player"
 version = "0.1.0"
 edition = "2021"
 
