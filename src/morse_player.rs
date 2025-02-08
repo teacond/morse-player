@@ -21,11 +21,56 @@ const SINK_BUFFER_SIZE: u32 = 3;
 pub type PlayingStartedCallback = Arc<dyn Fn() + 'static>;
 pub type PlayingEndedCallback = Arc<dyn Fn() + 'static>;
 
+#[derive(Clone, Copy)]
+#[derive(PartialEq)]
+pub enum TextType {
+    Letters,
+    Numbers,
+    Mixed,
+}
+
+#[derive(Clone, Copy)]
+#[derive(PartialEq)]
+pub enum SpeedModificationType {
+    None,
+    Speedup,
+    Slowing,
+    Zigzag,
+}
+
+#[derive(Clone, Copy)]
+#[derive(PartialEq)]
+pub enum WaveType {
+    Square,
+    Sine,
+    Triangle,
+    Sawtooth,
+}
+
+#[derive(Clone, Copy)]
+#[derive(PartialEq)]
+pub enum TextAdditions {
+    None,
+    Training,
+    CompetitionsLetters,
+    CompetitionsDigits,
+}
+
+/* 
+
+    ADDITIONS:
+        None                  without additions
+        Training              start part (VVV/=) and end part (.-.-.)
+        CompetitionsLetters   competitions start part for letters and mixed (OOOOO/speed/VVV/=) and end part (.-.-.)
+        CompetitionsDigits    competitions start part for digits (00000/speed/VVV/=) and end part (.-.-.)
+
+*/
+
 pub struct AudioPlayer {
     text: Vec<char>,
-    text_type: i32,
+    text_type: TextType,
     speed: f32,
-    modification: i32,
+    speed_modification_type: SpeedModificationType,
     min_speed: f32,
     max_speed: f32,
     modification_len: i32,
@@ -36,8 +81,8 @@ pub struct AudioPlayer {
     playing_started_callback: Option<PlayingStartedCallback>,
     playing_ended_callback: Option<PlayingEndedCallback>,
     actions_length: Arc<Mutex<HashMap<char, (i32, i32)>>>,
-    additions: i32,
-    wave_type: i32,
+    text_additions: TextAdditions,
+    wave_type: WaveType,
     frequency: i32,
 }
 
@@ -55,9 +100,9 @@ impl AudioPlayer {
         m.insert('|', (2, 0));
 
         AudioPlayer {text: Vec::<char>::new(), 
-            text_type: 0, 
+            text_type: TextType::Letters, 
             speed: 100.0,
-            modification: 0, 
+            speed_modification_type: SpeedModificationType::None, 
             min_speed: 100.0, 
             max_speed: 110.0, 
             modification_len: 10,
@@ -68,23 +113,23 @@ impl AudioPlayer {
             playing_started_callback: None,
             playing_ended_callback: None,
             actions_length: Arc::new(Mutex::new(m)),
-            additions: 1,
-            wave_type: 0,
+            text_additions: TextAdditions::Training,
+            wave_type: WaveType::Square,
             frequency: 750
         }
     }
 
     pub fn get_text_duration(&self) -> f32 {
-        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, 0, self.min_speed, self.max_speed, self.modification, self.modification_len);
+        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, TextAdditions::None, self.min_speed, self.max_speed, &self.speed_modification_type, self.modification_len);
         let (text_time, _) = get_time_and_timings(&text_preview, self.text_type, self.speed, Some(&speed_pattern), &self.actions_length.lock().unwrap());
         return text_time
     }
 
     pub fn get_start_part_duration(&self) -> f32 {
         let mut speed: f32 = self.speed;
-        if self.modification == 1 || self.modification == 3 {
+        if self.speed_modification_type == SpeedModificationType::Speedup || self.speed_modification_type == SpeedModificationType::Zigzag {
             speed = self.min_speed;
-        } else if self.modification == 2 {
+        } else if self.speed_modification_type == SpeedModificationType::Slowing {
             speed = self.max_speed;
         }
         let (text_time, _) = get_time_and_timings(&START_TEXT.to_vec(), self.text_type, speed, None, &self.actions_length.lock().unwrap());
@@ -92,7 +137,7 @@ impl AudioPlayer {
     }
 
     pub fn get_char_timings(&self) -> Vec<Duration> {
-        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, 0, self.min_speed, self.max_speed, self.modification, self.modification_len);
+        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, TextAdditions::None, self.min_speed, self.max_speed, &self.speed_modification_type, self.modification_len);
         let (_, time_pattern) = get_time_and_timings(&text_preview, self.text_type, self.speed, Some(&speed_pattern), &self.actions_length.lock().unwrap());
         return time_pattern
     }
@@ -101,7 +146,7 @@ impl AudioPlayer {
         self.text = text.to_vec();
     }
 
-    pub fn set_text_type(&mut self, text_type: i32) {
+    pub fn set_text_type(&mut self, text_type: TextType) {
         self.text_type = text_type;
     }
 
@@ -117,35 +162,36 @@ impl AudioPlayer {
         self.max_speed = max_speed;
     }
 
-    pub fn set_modification(&mut self, modification: i32) {
-        self.modification = modification;
+    pub fn set_modification(&mut self, modification: SpeedModificationType) {
+        self.speed_modification_type = modification;
     }
     pub async fn play(&self) {
         let local = tokio::task::LocalSet::new();
-        let end_notification = Arc::new(tokio::sync::Notify::new());
-    
+        let end_notification: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let text_start_notification: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let text_start_notification_ref = text_start_notification.clone();
         let text = self.text.clone();
         let text_type = self.text_type.clone();
         let mut speed = self.speed;
         let min_speed = self.min_speed;
         let max_speed = self.max_speed;
-        let modification = self.modification;
+        let speed_modification_type_ref = self.speed_modification_type.clone();
         let sink = self.sink.clone();
         let stop_flag = self.stop_flag.clone();
         let start_callback = self.playing_started_callback.clone();
         let end_callback = self.playing_ended_callback.clone();
         let actions_length = self.actions_length.lock().unwrap().clone();
         let modification_len = self.modification_len;
-        let additions = self.additions;
+        let additions = self.text_additions;
         let frequency = self.frequency;
         let wave_type = self.wave_type;
     
         stop_flag.store(false, Ordering::SeqCst);
         sink.lock().unwrap().play();
     
-        if modification == 1 || modification == 3 {
+        if self.speed_modification_type == SpeedModificationType::Speedup || self.speed_modification_type == SpeedModificationType::Zigzag {
             speed = min_speed;
-        } else if modification == 2 {
+        } else if self.speed_modification_type == SpeedModificationType::Slowing {
             speed = max_speed;
         }
     
@@ -160,7 +206,7 @@ impl AudioPlayer {
                 additions,
                 min_speed,
                 max_speed,
-                modification,
+                &speed_modification_type_ref,
                 modification_len,
             );
             play_audio(
@@ -173,18 +219,20 @@ impl AudioPlayer {
                 &actions_length,
                 frequency,
                 wave_type,
+                &text_start_notification
             );
             end_notification.notify_waiters();
         });
     
-        if additions == 1 {
+        if additions != TextAdditions::None {
             local.spawn_local(async move {
                 if let Some(callback) = start_callback {
                     tokio::select! {
                         _ = end_notification_ref.notified() => {
 
                         }
-                        _ = sleep(Duration::from_millis((start_part_duration * 1000.0) as u64)) => {
+                        _ = text_start_notification_ref.notified() => {
+                            sleep(Duration::from_millis((start_part_duration * 1000.0) as u64)).await;
                             callback();
                         }
                     }
@@ -234,22 +282,18 @@ impl AudioPlayer {
         self.frequency = frequency;
     }
     
-    pub fn set_wave_type(&mut self, wave_type: i32) {
+    pub fn set_wave_type(&mut self, wave_type: WaveType) {
         self.wave_type = wave_type;
     }
 
     pub fn set_volume(&mut self, volume: i32) {
         self.sink.lock().unwrap().set_volume(volume as f32 / 100.0);
     }
+
+    pub fn set_text_additions(&mut self, text_additions: TextAdditions) {
+        self.text_additions = text_additions;
+    }
 }
-
-/*
-    PAUSES DESCRIPTION:
-        * - Pause beetween dots or dashes
-        $ - Pause beetween characters
-        / - Pause beetween words
-
-*/
 
 fn apply_hann_window(samples: &mut Array1<f32>, fade_in_samples: usize, fade_out_samples: usize) {
     let hann_in = Array1::linspace(0.0, PI, fade_in_samples)
@@ -268,14 +312,14 @@ fn apply_hann_window(samples: &mut Array1<f32>, fade_in_samples: usize, fade_out
     }
 }
 
-fn get_wave(wave_type: i32, frequency: i32, speed_to_use: f32, duration_multiplier: i32) -> Array1::<f32> {
+fn get_wave(wave_type: WaveType, frequency: i32, speed_to_use: f32, duration_multiplier: i32) -> Array1::<f32> {
     let fade_in_samples = (SAMPLE_RATE as f32 * FADE_IN) as usize;
     let fade_out_samples = (SAMPLE_RATE as f32 * FADE_OUT) as usize;
     let samples_count_in_dot = SAMPLE_RATE as f32 * speed_to_use;
     let samples_wave_count = samples_count_in_dot * duration_multiplier as f32;
     let t_wave = Array1::linspace(0.0, speed_to_use * duration_multiplier as f32, samples_wave_count as usize);
     let mut wave = match wave_type {
-        0 => { // square wave
+        WaveType::Square => {
             let mut wave = Array1::zeros(t_wave.len());
             for harmonic in 0..HARMONICS_COUNT {
                 let harmonic_frequency = (frequency * (2 * harmonic as i32 + 1)) as f32;
@@ -284,10 +328,10 @@ fn get_wave(wave_type: i32, frequency: i32, speed_to_use: f32, duration_multipli
             }
             wave
         }
-        1 => { // sine wave
+        WaveType::Sine => {
             (2.0 * PI * frequency as f32 * t_wave).mapv(f32::sin)
         }
-        2 => { // triangle wave
+        WaveType::Triangle => {
             let mut wave = Array1::zeros(t_wave.len());
             for harmonic in 0..HARMONICS_COUNT {
                 let harmonic_frequency = (frequency * (2 * harmonic as i32 + 1)) as f32;
@@ -297,7 +341,7 @@ fn get_wave(wave_type: i32, frequency: i32, speed_to_use: f32, duration_multipli
             }
             wave
         }
-        3 => { // sawtooth wave
+        WaveType::Sawtooth => {
             let mut wave = Array1::zeros(t_wave.len());
             for harmonic in 1..HARMONICS_COUNT {
                 let harmonic_frequency = (frequency * harmonic as i32) as f32;
@@ -306,7 +350,6 @@ fn get_wave(wave_type: i32, frequency: i32, speed_to_use: f32, duration_multipli
             }
             wave
         }
-        _ => panic!("Invalid wave type"),
     };
 
     // Wave normalization
@@ -327,8 +370,16 @@ fn get_silence(speed_to_use: f32, duration_multiplier: i32) -> Vec<f32> {
     silence
 }
 
-fn play_audio(text: &Vec<char>, text_type: i32, speed: f32, sink: &Sink, stop_flag: &Arc<AtomicBool>, 
-    speed_pattern: &Vec<f32>, actions_length: &HashMap<char, (i32, i32)>, frequency: i32, wave_type: i32) {
+/*
+    DESCRIPTION OF PAUSES:
+        * - Pause beetween dots or dashes
+        $ - Pause beetween characters
+        / - Pause beetween words
+
+*/
+
+fn play_audio(text: &Vec<char>, text_type: TextType, speed: f32, sink: &Sink, stop_flag: &Arc<AtomicBool>, 
+    speed_pattern: &Vec<f32>, actions_length: &HashMap<char, (i32, i32)>, frequency: i32, wave_type: WaveType, text_start_notification: &Arc<tokio::sync::Notify>) {
     let mut sound_signal = Vec::<f32>::new();
     let mut speed_to_use = get_speed_from_text_type(text_type, speed);
     let mut char_now = 0;
@@ -382,6 +433,9 @@ fn play_audio(text: &Vec<char>, text_type: i32, speed: f32, sink: &Sink, stop_fl
                 std::thread::sleep(Duration::from_millis(5));
             }
             sink.append(rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE, sound_signal.to_vec()));
+            if i == 0 {
+                text_start_notification.notify_waiters();
+            }
             sound_signal.clear();
         }
     }
@@ -394,16 +448,7 @@ fn play_audio(text: &Vec<char>, text_type: i32, speed: f32, sink: &Sink, stop_fl
     }
 }
 
-/* 
-
-    ADDITIONS:
-        0   without additions
-        1   VVV= and end part
-        2   competitions part
-
-*/
-
-fn gen_audio_prev_vec(text: &Vec<char>, additions: i32, min_speed: f32, max_speed: f32, modification: i32, modification_len: i32) -> (Vec<f32>, Vec<char>) {
+fn gen_audio_prev_vec(text: &Vec<char>, text_additions: TextAdditions, min_speed: f32, max_speed: f32, speed_modification_type: &SpeedModificationType, modification_len: i32) -> (Vec<f32>, Vec<char>) {
     let morse: HashMap<char, &str> = [
         ('A', ".-"), ('B', "-..."), ('C', "-.-."), ('D', "-.."), ('E', "."),
         ('F', "..-."), ('G', "--."), ('H', "...."), ('I', ".."), ('J', ".---"),
@@ -419,23 +464,36 @@ fn gen_audio_prev_vec(text: &Vec<char>, additions: i32, min_speed: f32, max_spee
     let speed_difference = max_speed - min_speed;
     let modification_len = modification_len * 5;
     let mut char_now: i32 = 0;
-    if additions == 1 {
-        for element in START_TEXT {
-            audio_vec.push(element);
-        }
-    }
+
+    match text_additions {
+        TextAdditions::None => {
+
+        },
+        TextAdditions::Training => {
+            for element in START_TEXT {
+                audio_vec.push(element);
+            }
+        },
+        TextAdditions::CompetitionsLetters => {
+
+        },
+        TextAdditions::CompetitionsDigits => {
+
+        },
+    };
+
     for (i, element) in text.iter().enumerate() {
-        if *element != ' ' && modification > 0 {
-            let speed_on_char: f32 = match modification {
-                1 => {
+        if *element != ' ' && *speed_modification_type != SpeedModificationType::None {
+            let speed_on_char: f32 = match speed_modification_type {
+                SpeedModificationType::Speedup => {
                     let speed_on_char = speed_difference / (modification_len - 1) as f32 * char_now as f32 + min_speed;
                     speed_on_char
                 }
-                2 => {
+                SpeedModificationType::Slowing => {
                     let speed_on_char = max_speed - (speed_difference / (modification_len - 1) as f32 * char_now as f32);
                     speed_on_char
                 }
-                3 => {
+                SpeedModificationType::Zigzag => {
                     let speed_on_char: f32;
                     if char_now < modification_len / 2 {
                         speed_on_char = speed_difference / ((modification_len / 2) - 1) as f32 * char_now as f32 + min_speed;
@@ -473,7 +531,7 @@ fn gen_audio_prev_vec(text: &Vec<char>, additions: i32, min_speed: f32, max_spee
         }
         else if *element == ' ' {
             let audio_vec_len = audio_vec.len();
-            if char_now == 0 && modification > 0 { // if enabled modification, make latest silence long
+            if char_now == 0 && *speed_modification_type != SpeedModificationType::None { // if enabled modification, make latest silence long
                 speed_pattern.push(min_speed);
                 audio_vec[audio_vec_len - 1] = '|';
                 audio_vec.push('/');
@@ -484,30 +542,43 @@ fn gen_audio_prev_vec(text: &Vec<char>, additions: i32, min_speed: f32, max_spee
         }
     }
 
-    if additions == 1 { 
-        for element in END_TEXT {
-            audio_vec.push(element);
-        }
-    }
+    match text_additions {
+        TextAdditions::None => {
+
+        },
+        TextAdditions::Training => {
+            for element in END_TEXT {
+                audio_vec.push(element);
+            }
+        },
+        TextAdditions::CompetitionsLetters => {
+
+        },
+        TextAdditions::CompetitionsDigits => {
+
+        },
+    };
 
     return (speed_pattern, audio_vec);
 }
 
-fn get_speed_from_text_type(text_type: i32, speed: f32) -> f32 { // calculating absolute speed of text
+fn get_speed_from_text_type(text_type: TextType, speed: f32) -> f32 { // calculating absolute speed of text
     let speed_to_use;
-    if text_type == 0 {
-        speed_to_use = LETTERS_DURATION * 100.0 / speed;
-    }
-    else if text_type == 1 {
-        speed_to_use = DIGITS_DURATION * 100.0 / speed;
-    }
-    else {
-        speed_to_use = MIXED_DURATION * 100.0 / speed;
+    match text_type {
+        TextType::Letters => {
+            speed_to_use = LETTERS_DURATION * 100.0 / speed;
+        }
+        TextType::Numbers => {
+            speed_to_use = DIGITS_DURATION * 100.0 / speed;
+        }
+        TextType::Mixed => {
+            speed_to_use = MIXED_DURATION * 100.0 / speed;
+        }
     }
     speed_to_use
 }
 
-fn get_time_and_timings(audio_prev_vec: &Vec<char>, text_type: i32, speed: f32, speed_pattern: Option<&Vec<f32>>, actions_length: &HashMap<char, (i32, i32)>) -> (f32, Vec<Duration>) {
+fn get_time_and_timings(audio_prev_vec: &Vec<char>, text_type: TextType, speed: f32, speed_pattern: Option<&Vec<f32>>, actions_length: &HashMap<char, (i32, i32)>) -> (f32, Vec<Duration>) {
     let mut time_pattern_vec = Vec::<Duration>::new();
     let mut duration: f32 = 0.0;
     let mut char_now = 0;
