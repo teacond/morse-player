@@ -11,10 +11,24 @@ const MIXED_DURATION: f32 = 0.042;
 const HARMONICS_COUNT: u32 = 20;
 const FADE_IN: f32 = 0.0004;
 const FADE_OUT: f32 = 0.0002;
-const START_TEXT: [char; 35] = ['*', '.', '*', '.', '*', '.', '*', '-', '$',
+const START_TEXT: [char; 34] = ['.', '*', '.', '*', '.', '*', '-', '$',
                                 '.', '*', '.', '*', '.', '*', '-', '$',
                                 '.', '*', '.', '*', '.', '*', '-', '/',
                                 '-', '*', '.', '*', '.', '*', '.', '*', '-', '/'];
+const START_TEXT_COMPETITIONS_LETTERS: [char; 30] = [
+'-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '/'
+];
+const START_TEXT_COMPETITIONS_DIGITS: [char; 50] = [
+'-', '*', '-', '*', '-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '*', '-', '*', '-', '$',
+'-', '*', '-', '*', '-', '*', '-', '*', '-', '/'
+];
 const END_TEXT: [char; 10] = ['/', '.', '*', '-', '*', '.', '*', '-', '*', '.'];
 const SINK_BUFFER_SIZE: u32 = 3;
 
@@ -25,7 +39,7 @@ pub type PlayingEndedCallback = Arc<dyn Fn() + 'static>;
 #[derive(PartialEq)]
 pub enum TextType {
     Letters,
-    Numbers,
+    Digits,
     Mixed,
 }
 
@@ -52,8 +66,7 @@ pub enum WaveType {
 pub enum TextAdditions {
     None,
     Training,
-    CompetitionsLetters,
-    CompetitionsDigits,
+    Competitions
 }
 
 /* 
@@ -120,7 +133,7 @@ impl AudioPlayer {
     }
 
     pub fn get_text_duration(&self) -> f32 {
-        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, TextAdditions::None, self.min_speed, self.max_speed, &self.speed_modification_type, self.modification_len);
+        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, self.min_speed, self.max_speed, self.speed_modification_type, self.modification_len);
         let (text_time, _) = get_time_and_timings(&text_preview, self.text_type, self.speed, Some(&speed_pattern), &self.actions_length.lock().unwrap());
         return text_time
     }
@@ -132,12 +145,13 @@ impl AudioPlayer {
         } else if self.speed_modification_type == SpeedModificationType::Slowing {
             speed = self.max_speed;
         }
-        let (text_time, _) = get_time_and_timings(&START_TEXT.to_vec(), self.text_type, speed, None, &self.actions_length.lock().unwrap());
+        let start_text: Vec<char> = gen_start_part_prev_vec(self.text_additions, self.text_type, speed);
+        let (text_time, _) = get_time_and_timings(&start_text, self.text_type, speed, None, &self.actions_length.lock().unwrap());
         return text_time
     }
 
     pub fn get_char_timings(&self) -> Vec<Duration> {
-        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, TextAdditions::None, self.min_speed, self.max_speed, &self.speed_modification_type, self.modification_len);
+        let (speed_pattern, text_preview) = gen_audio_prev_vec(&self.text, self.min_speed, self.max_speed, self.speed_modification_type, self.modification_len);
         let (_, time_pattern) = get_time_and_timings(&text_preview, self.text_type, self.speed, Some(&speed_pattern), &self.actions_length.lock().unwrap());
         return time_pattern
     }
@@ -168,14 +182,12 @@ impl AudioPlayer {
     pub async fn play(&self) {
         let local = tokio::task::LocalSet::new();
         let end_notification: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-        let text_start_notification: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-        let text_start_notification_ref = text_start_notification.clone();
         let text = self.text.clone();
         let text_type = self.text_type.clone();
         let mut speed = self.speed;
         let min_speed = self.min_speed;
         let max_speed = self.max_speed;
-        let speed_modification_type_ref = self.speed_modification_type.clone();
+        let speed_modification_type_ref = self.speed_modification_type;
         let sink = self.sink.clone();
         let stop_flag = self.stop_flag.clone();
         let start_callback = self.playing_started_callback.clone();
@@ -201,16 +213,21 @@ impl AudioPlayer {
     
         thread::spawn(move || {
             let unlocked_sink = sink.lock().unwrap();
+            let mut text_to_play: Vec<char> = Vec::new();
             let (mode_speed_pattern, text_preview) = gen_audio_prev_vec(
                 &text,
-                additions,
                 min_speed,
                 max_speed,
-                &speed_modification_type_ref,
+                speed_modification_type_ref,
                 modification_len,
             );
+            text_to_play.extend(gen_start_part_prev_vec(additions, text_type, speed));
+            text_to_play.extend(text_preview);
+            if additions != TextAdditions::None {
+                text_to_play.extend(END_TEXT);
+            }
             play_audio(
-                &text_preview,
+                &text_to_play,
                 text_type,
                 speed,
                 &unlocked_sink,
@@ -219,26 +236,18 @@ impl AudioPlayer {
                 &actions_length,
                 frequency,
                 wave_type,
-                &text_start_notification
             );
             end_notification.notify_waiters();
         });
     
-        if additions != TextAdditions::None {
-            local.spawn_local(async move {
-                if let Some(callback) = start_callback {
-                    tokio::select! {
-                        _ = end_notification_ref.notified() => {
-
-                        }
-                        _ = text_start_notification_ref.notified() => {
-                            sleep(Duration::from_millis((start_part_duration * 1000.0) as u64)).await;
-                            callback();
-                        }
-                    }
+        local.spawn_local(async move {
+            if let Some(callback) = start_callback {
+                tokio::select! {
+                    _ = end_notification_ref.notified() => { }
+                    _ = sleep(Duration::from_millis((start_part_duration * 1000.0) as u64)) => callback()
                 }
-            });
-        }
+            }
+        });
     
         local.spawn_local(async move {
             end_notification_ref2.notified().await;
@@ -255,7 +264,7 @@ impl AudioPlayer {
         self.sink.lock().unwrap().clear();
     }
 
-    pub fn connect_playing_started_callback<F>(&mut self, callback: F)
+    pub fn connect_main_text_started_callback<F>(&mut self, callback: F)
     where
         F: Fn() + 'static,
     {
@@ -286,8 +295,8 @@ impl AudioPlayer {
         self.wave_type = wave_type;
     }
 
-    pub fn set_volume(&mut self, volume: i32) {
-        self.sink.lock().unwrap().set_volume(volume as f32 / 100.0);
+    pub fn set_volume(&mut self, volume: f32) {
+        self.sink.lock().unwrap().set_volume(volume);
     }
 
     pub fn set_text_additions(&mut self, text_additions: TextAdditions) {
@@ -379,7 +388,7 @@ fn get_silence(speed_to_use: f32, duration_multiplier: i32) -> Vec<f32> {
 */
 
 fn play_audio(text: &Vec<char>, text_type: TextType, speed: f32, sink: &Sink, stop_flag: &Arc<AtomicBool>, 
-    speed_pattern: &Vec<f32>, actions_length: &HashMap<char, (i32, i32)>, frequency: i32, wave_type: WaveType, text_start_notification: &Arc<tokio::sync::Notify>) {
+    speed_pattern: &Vec<f32>, actions_length: &HashMap<char, (i32, i32)>, frequency: i32, wave_type: WaveType) {
     let mut sound_signal = Vec::<f32>::new();
     let mut speed_to_use = get_speed_from_text_type(text_type, speed);
     let mut char_now = 0;
@@ -433,9 +442,6 @@ fn play_audio(text: &Vec<char>, text_type: TextType, speed: f32, sink: &Sink, st
                 std::thread::sleep(Duration::from_millis(5));
             }
             sink.append(rodio::buffer::SamplesBuffer::new(1, SAMPLE_RATE, sound_signal.to_vec()));
-            if i == 0 {
-                text_start_notification.notify_waiters();
-            }
             sound_signal.clear();
         }
     }
@@ -448,7 +454,39 @@ fn play_audio(text: &Vec<char>, text_type: TextType, speed: f32, sink: &Sink, st
     }
 }
 
-fn gen_audio_prev_vec(text: &Vec<char>, text_additions: TextAdditions, min_speed: f32, max_speed: f32, speed_modification_type: &SpeedModificationType, modification_len: i32) -> (Vec<f32>, Vec<char>) {
+fn gen_start_part_prev_vec(text_additions: TextAdditions, text_type: TextType, speed: f32) -> Vec<char> {
+    let mut start_part: Vec<char> = Vec::new();
+    let mut speed_chars_vec: Vec<char> = Vec::new();
+    let speed_str = (speed.round() as i32).to_string();
+    for ch in speed_str.chars() {
+        speed_chars_vec.push(ch);
+    }
+    match text_additions {
+        TextAdditions::None => {
+
+        },
+        TextAdditions::Training => {
+            start_part.extend(START_TEXT);
+        }
+        TextAdditions::Competitions => {
+            if text_type == TextType::Digits {
+                start_part.extend(START_TEXT_COMPETITIONS_DIGITS);
+                start_part.extend(gen_audio_prev_vec(&speed_chars_vec, 100.0, 100.0, SpeedModificationType::None, 10).1);
+                start_part.push('/');
+                start_part.extend(START_TEXT);
+            }
+            else {
+                start_part.extend(START_TEXT_COMPETITIONS_LETTERS);
+                start_part.extend(gen_audio_prev_vec(&speed_chars_vec, 100.0, 100.0, SpeedModificationType::None, 10).1);
+                start_part.push('/');
+                start_part.extend(START_TEXT);
+            }
+        },
+    }
+    start_part
+}
+
+fn gen_audio_prev_vec(text: &Vec<char>, min_speed: f32, max_speed: f32, speed_modification_type: SpeedModificationType, modification_len: i32) -> (Vec<f32>, Vec<char>) {
     let morse: HashMap<char, &str> = [
         ('A', ".-"), ('B', "-..."), ('C', "-.-."), ('D', "-.."), ('E', "."),
         ('F', "..-."), ('G', "--."), ('H', "...."), ('I', ".."), ('J', ".---"),
@@ -465,25 +503,8 @@ fn gen_audio_prev_vec(text: &Vec<char>, text_additions: TextAdditions, min_speed
     let modification_len = modification_len * 5;
     let mut char_now: i32 = 0;
 
-    match text_additions {
-        TextAdditions::None => {
-
-        },
-        TextAdditions::Training => {
-            for element in START_TEXT {
-                audio_vec.push(element);
-            }
-        },
-        TextAdditions::CompetitionsLetters => {
-
-        },
-        TextAdditions::CompetitionsDigits => {
-
-        },
-    };
-
     for (i, element) in text.iter().enumerate() {
-        if *element != ' ' && *speed_modification_type != SpeedModificationType::None {
+        if *element != ' ' && speed_modification_type != SpeedModificationType::None {
             let speed_on_char: f32 = match speed_modification_type {
                 SpeedModificationType::Speedup => {
                     let speed_on_char = speed_difference / (modification_len - 1) as f32 * char_now as f32 + min_speed;
@@ -531,7 +552,7 @@ fn gen_audio_prev_vec(text: &Vec<char>, text_additions: TextAdditions, min_speed
         }
         else if *element == ' ' {
             let audio_vec_len = audio_vec.len();
-            if char_now == 0 && *speed_modification_type != SpeedModificationType::None { // if enabled modification, make latest silence long
+            if char_now == 0 && speed_modification_type != SpeedModificationType::None { // if enabled modification, make latest silence long
                 speed_pattern.push(min_speed);
                 audio_vec[audio_vec_len - 1] = '|';
                 audio_vec.push('/');
@@ -542,23 +563,6 @@ fn gen_audio_prev_vec(text: &Vec<char>, text_additions: TextAdditions, min_speed
         }
     }
 
-    match text_additions {
-        TextAdditions::None => {
-
-        },
-        TextAdditions::Training => {
-            for element in END_TEXT {
-                audio_vec.push(element);
-            }
-        },
-        TextAdditions::CompetitionsLetters => {
-
-        },
-        TextAdditions::CompetitionsDigits => {
-
-        },
-    };
-
     return (speed_pattern, audio_vec);
 }
 
@@ -568,7 +572,7 @@ fn get_speed_from_text_type(text_type: TextType, speed: f32) -> f32 { // calcula
         TextType::Letters => {
             speed_to_use = LETTERS_DURATION * 100.0 / speed;
         }
-        TextType::Numbers => {
+        TextType::Digits => {
             speed_to_use = DIGITS_DURATION * 100.0 / speed;
         }
         TextType::Mixed => {
